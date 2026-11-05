@@ -1,0 +1,60 @@
+import {PGlite} from '@electric-sql/pglite';
+import {btree_gist} from '@electric-sql/pglite/contrib/btree_gist';
+import {readFile} from 'node:fs/promises';
+import assert from 'node:assert/strict';
+const db=new PGlite({extensions:{btree_gist}});
+await db.exec(`
+ create role anon; create role authenticated;
+ create schema auth;
+ create table auth.users(id uuid primary key,raw_user_meta_data jsonb default '{}');
+ create function auth.uid() returns uuid language sql stable as $$select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid$$;
+ grant usage on schema auth to authenticated;
+ grant execute on function auth.uid() to authenticated;
+ create publication supabase_realtime;
+ alter default privileges in schema public grant select,insert,update,delete on tables to authenticated;
+`);
+await db.exec(await readFile(new URL('../supabase/migrations/001_barbershop.sql',import.meta.url),'utf8'));
+const client='00000000-0000-0000-0000-000000000001', other='00000000-0000-0000-0000-000000000002', owner='00000000-0000-0000-0000-000000000003';
+await db.query(`insert into auth.users(id,raw_user_meta_data) values ($1,'{"name":"João","phone":"11999999999"}'),($2,'{"name":"Maria"}'),($3,'{"name":"Dono"}')`,[client,other,owner]);
+await db.query('insert into public.admins(user_id) values($1)',[owner]);
+const service=(await db.query(`select * from services where duration=60`)).rows[0];
+const day=(await db.query(`select ((now() at time zone 'America/Sao_Paulo')::date + (8-extract(dow from now() at time zone 'America/Sao_Paulo')::int)%7+1)::text as d`)).rows[0].d;
+// Make the chosen day open regardless of the wall clock weekday.
+await db.exec(`update hours set active=true`);
+async function as(id){await db.exec('reset role');await db.query(`select set_config('request.jwt.claim.sub',$1,false)`,[id]);await db.exec('set role authenticated');}
+async function rows(sql,args=[]){return (await db.query(sql,args)).rows;}
+let checks=0;
+async function check(name,fn){await fn();checks++;console.log('PASS',name);}
+await as(client);
+await check('signup does not grant admin',async()=>assert.equal((await rows('select is_admin() as v'))[0].v,false));
+await check('client cannot grant itself admin',async()=>assert.rejects(()=>db.query('insert into admins values($1)',[client])));
+await check('client only sees its own profile',async()=>assert.equal((await rows('select * from profiles')).length,1));
+const slots=await rows('select * from available_slots($1,$2)',[service.id,day]);assert(slots.length>0);
+const first=slots[0].starts_at;
+let appointment;
+await check('booking and notification are committed together',async()=>{appointment=(await rows('select book($1,$2) as id',[service.id,first]))[0].id;await db.exec('reset role');const notes=await rows('select * from notifications where appointment_id=$1',[appointment]);assert.equal(notes.length,1);assert.match(notes[0].body,/João/);await as(client);});
+await check('snapshot uses database price and duration',async()=>{const a=(await rows('select * from appointments where id=$1',[appointment]))[0];assert.equal(a.price_cents,service.price_cents);assert.equal(a.duration,60);});
+await check('same slot is rejected',async()=>assert.rejects(()=>db.query('select book($1,$2)',[service.id,first])));
+await check('overlapping duration is rejected',async()=>assert.rejects(()=>db.query('select book($1,$2)',[service.id,new Date(new Date(first).getTime()+15*60000).toISOString()])));
+await check('adjacent slot stays free',async()=>{const next=new Date(new Date(first).getTime()+60*60000).toISOString();const free=await rows('select * from available_slots($1,$2)',[service.id,day]);assert(free.some(x=>new Date(x.starts_at).toISOString()===next));});
+await check('direct price/status manipulation is denied',async()=>assert.rejects(()=>db.query(`update appointments set price_cents=1 where id=$1`,[appointment])));
+await check('client cannot read admin notifications',async()=>assert.equal((await rows('select * from notifications')).length,0));
+await as(other);
+await check('different client cannot see booking',async()=>assert.equal((await rows('select * from appointments')).length,0));
+await check('different client cannot cancel booking',async()=>assert.rejects(()=>db.query(`select change_status($1,'cancelled')`,[appointment])));
+await as(client);
+await check('client cannot complete own booking',async()=>assert.rejects(()=>db.query(`select change_status($1,'completed')`,[appointment])));
+await check('cancel releases occupied interval',async()=>{await db.query(`select change_status($1,'cancelled')`,[appointment]);const free=await rows('select * from available_slots($1,$2)',[service.id,day]);assert.equal(free.length,slots.length);});
+await check('past booking is rejected',async()=>assert.rejects(()=>db.query('select book($1,now()-interval \'1 day\')',[service.id])));
+await check('changed price requires a new confirmation',async()=>assert.rejects(()=>db.query('select book($1,$2,$3,$4)',[service.id,first,service.price_cents+100,service.duration])));
+await as(owner);
+await check('admin sees clients and notification',async()=>{assert.equal((await rows('select * from profiles')).length,3);assert.equal((await rows('select * from notifications')).length,1);});
+await check('block removes availability',async()=>{await db.query(`insert into blocks(starts_at,ends_at) values($1,$2)`,[first,new Date(new Date(first).getTime()+3600000).toISOString()]);assert((await rows('select * from available_slots($1,$2)',[service.id,day])).length<slots.length);});
+await as(client);
+await check('blocked booking is rejected',async()=>assert.rejects(()=>db.query('select book($1,$2)',[service.id,first])));
+await check('client cannot change services',async()=>{await db.query('update services set price_cents=1 where id=$1',[service.id]);await db.exec('reset role');assert.equal((await rows('select price_cents from services where id=$1',[service.id]))[0].price_cents,service.price_cents);await as(client);});
+await check('client cannot register owner push token',async()=>assert.rejects(()=>db.query(`insert into push_tokens(token,user_id) values('ExpoPushToken[test]',$1)`,[client])));
+await as(owner);
+await check('admin can mark notification read, cannot rewrite body',async()=>{await db.exec('update notifications set read_at=now()');await assert.rejects(()=>db.exec("update notifications set body='tampered'"));});
+console.log(`\n${checks} database checks passed (embedded PostgreSQL; hosted integration still requires configuration).`);
+await db.close();
